@@ -1,0 +1,218 @@
+########################################################################
+# Self-hosted n8n for the WooCommerce AI agent stack.
+#
+#   cd infra
+#   cp .env.example .env     # fill it in, then:
+#   docker compose up -d
+#   open http://localhost:${N8N_HOST_PORT:-5678}
+#
+# Two Postgres databases live in one server: n8n's own (workflows,
+# executions, encrypted credentials) and ecom_ops (sql/schema.sql - the
+# decision log, review queue, restock tasks and failures the workflows
+# read and write). db/init runs once, on the first boot of an empty
+# volume, and creates both.
+#
+# There is no TLS here on purpose. Put this behind a reverse proxy you
+# already run (Caddy, Traefik, nginx) or deploy the Render blueprint in
+# infra/render.yaml, which terminates TLS for you.
+########################################################################
+
+name: n8n-ecom
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    # Pinned. n8n 2.x warns on Postgres 16 and older; minor upgrades are
+    # safe, major ones need a dump and restore.
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      ECOM_OPS_DB: ${ECOM_OPS_DB}
+      # Fail fast on a weak setup rather than silently allowing trust auth.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      # Mounted outside initdb.d on purpose: the init script applies it to the
+      # ecom_ops database only, not to n8n's own.
+      - ../sql/schema.sql:/schema/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [n8nnet]
+
+  n8n:
+    # Pin the version you tested. "latest" means an unattended restart can
+    # change node behaviour at 3am. github.com/n8n-io/n8n/releases
+    image: docker.n8n.io/n8nio/n8n:2.40.5
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${N8N_HOST_PORT:-5678}:5678"
+    environment:
+      # --- identity / URLs -------------------------------------------------
+      N8N_PORT: 5678
+      N8N_LISTEN_ADDRESS: 0.0.0.0
+      # WEBHOOK_URL must be the origin WooCommerce and your chat widget can
+      # actually reach. Get this wrong and n8n hands you a production webhook
+      # URL pointing at the container's internal address.
+      N8N_EDITOR_BASE_URL: ${N8N_PUBLIC_URL}
+      # n8n 2.x renamed WEBHOOK_URL to N8N_WEBHOOK_URL; the old name still
+      # works but logs a deprecation warning on every boot.
+      N8N_WEBHOOK_URL: ${N8N_PUBLIC_URL}
+      N8N_PROXY_HOPS: ${N8N_PROXY_HOPS:-0}
+
+      # --- secrets ---------------------------------------------------------
+      # Every credential in the database is encrypted with this key. Lose it
+      # and they are unrecoverable; change it and n8n refuses to start against
+      # an existing database. Back it up with the database, not next to it.
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+
+      # --- persistence -----------------------------------------------------
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_SCHEMA: public
+
+      # --- execution data pruning -----------------------------------------
+      # Without this, execution_data grows until the disk - not the workflow -
+      # is what takes the store's automation down.
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: ${EXECUTIONS_DATA_MAX_AGE:-336}
+      EXECUTIONS_DATA_PRUNE_MAX_COUNT: ${EXECUTIONS_DATA_PRUNE_MAX_COUNT:-20000}
+      EXECUTIONS_DATA_SAVE_ON_SUCCESS: all
+      EXECUTIONS_DATA_SAVE_ON_ERROR: all
+      EXECUTIONS_DATA_SAVE_ON_PROGRESS: "true"
+      EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS: "true"
+
+      # --- Code node requirements -----------------------------------------
+      # Workflows 01 and 02 verify webhook signatures in a Code node, and
+      # every workflow reads configuration from $env. Neither is allowed by
+      # default.
+      NODE_FUNCTION_ALLOW_BUILTIN: crypto
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+
+      # --- store configuration, read by the workflows via {{ $env.X }} -----
+      STORE_NAME: ${STORE_NAME}
+      STORE_CURRENCY: ${STORE_CURRENCY}
+      WOO_API_BASE: ${WOO_API_BASE}
+      WOO_WEBHOOK_SECRET: ${WOO_WEBHOOK_SECRET}
+      SUPPORT_WEBHOOK_SECRET: ${SUPPORT_WEBHOOK_SECRET}
+      SUPPORT_API_BASE: ${SUPPORT_API_BASE}
+      SUPPORT_CONFIDENCE_THRESHOLD: ${SUPPORT_CONFIDENCE_THRESHOLD}
+      LLM_API_BASE: ${LLM_API_BASE}
+      LLM_MODEL: ${LLM_MODEL}
+      EMAIL_API_BASE: ${EMAIL_API_BASE}
+      WELCOME_SEQUENCE_ID: ${WELCOME_SEQUENCE_ID}
+      HIGH_VALUE_ORDER_THRESHOLD: ${HIGH_VALUE_ORDER_THRESHOLD}
+      VIP_LIFETIME_VALUE_THRESHOLD: ${VIP_LIFETIME_VALUE_THRESHOLD}
+      ABANDONED_CART_MIN_AGE_HOURS: ${ABANDONED_CART_MIN_AGE_HOURS}
+      ABANDONED_CART_MAX_AGE_HOURS: ${ABANDONED_CART_MAX_AGE_HOURS}
+      LOW_STOCK_THRESHOLD: ${LOW_STOCK_THRESHOLD}
+      SLACK_HUMAN_REVIEW_WEBHOOK_URL: ${SLACK_HUMAN_REVIEW_WEBHOOK_URL}
+      SLACK_SALES_WEBHOOK_URL: ${SLACK_SALES_WEBHOOK_URL}
+      SLACK_SUPPLIER_WEBHOOK_URL: ${SLACK_SUPPLIER_WEBHOOK_URL}
+      SLACK_ALERTS_WEBHOOK_URL: ${SLACK_ALERTS_WEBHOOK_URL}
+
+      # --- housekeeping ----------------------------------------------------
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-Europe/London}
+      TZ: ${GENERIC_TIMEZONE:-Europe/London}
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_HIRING_BANNER_ENABLED: "false"
+      N8N_PAYLOAD_SIZE_MAX: 16
+      N8N_LOG_LEVEL: ${N8N_LOG_LEVEL:-info}
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_RUNNERS_MAX_PAYLOAD: 33554432
+
+      # --- queue mode (see the commented redis/worker services below) ------
+      # EXECUTIONS_MODE: queue
+      # QUEUE_BULL_REDIS_HOST: redis
+      # QUEUE_BULL_REDIS_PORT: 6379
+      # QUEUE_HEALTH_CHECK_ACTIVE: "true"
+      # OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS: "true"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      # Read-only mount of the repo's workflows, so a fresh instance can be
+      # populated with:
+      #   docker compose exec n8n n8n import:workflow --separate --input=/workflows
+      - ../workflows:/workflows:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    networks: [n8nnet]
+
+  # --------------------------------------------------------------------
+  # Queue mode. Turn it on when one n8n process can no longer keep up -
+  # in practice, when webhook responses start queueing behind long
+  # executions, or a Wait node holding an execution blocks throughput.
+  #
+  # Uncomment redis and n8n-worker, uncomment the EXECUTIONS_MODE block
+  # above, then `docker compose up -d`.
+  # --------------------------------------------------------------------
+  # redis:
+  #   image: redis:7.4-alpine
+  #   restart: unless-stopped
+  #   command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+  #   volumes:
+  #     - redis_data:/data
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 10
+  #   networks: [n8nnet]
+  #
+  # n8n-worker:
+  #   image: docker.n8n.io/n8nio/n8n:2.40.5
+  #   restart: unless-stopped
+  #   command: worker --concurrency=10
+  #   depends_on:
+  #     n8n: { condition: service_healthy }
+  #     redis: { condition: service_healthy }
+  #   environment:
+  #     # A worker needs the same encryption key and the same database, or it
+  #     # cannot decrypt the credentials it is handed.
+  #     N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+  #     DB_TYPE: postgresdb
+  #     DB_POSTGRESDB_HOST: postgres
+  #     DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+  #     DB_POSTGRESDB_USER: ${POSTGRES_USER}
+  #     DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+  #     EXECUTIONS_MODE: queue
+  #     QUEUE_BULL_REDIS_HOST: redis
+  #     NODE_FUNCTION_ALLOW_BUILTIN: crypto
+  #     N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+  #     GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-Europe/London}
+  #     TZ: ${GENERIC_TIMEZONE:-Europe/London}
+  #   volumes:
+  #     - n8n_data:/home/node/.n8n
+  #   networks: [n8nnet]
+
+networks:
+  n8nnet:
+
+volumes:
+  postgres_data:
+  n8n_data:
+  # redis_data:

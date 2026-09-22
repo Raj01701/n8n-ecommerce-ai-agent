@@ -1,0 +1,684 @@
+{
+  "name": "01 - Ecommerce Support Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "support/inbound",
+        "responseMode": "onReceived",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -720,
+        300
+      ],
+      "id": "a1000001-0001-4a1b-9c2d-000000000001",
+      "name": "Support Webhook",
+      "webhookId": "a1000001-0001-4a1b-9c2d-supportinbox",
+      "notes": "Chat widget, contact form or email-to-webhook bridge posts here. Answered 202 immediately; the reply goes back out through the helpdesk API so a slow LLM call never holds the customer's browser open."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// One inbound customer message from the chat widget or the email-to-webhook\n// bridge. Nothing downstream is allowed to trust a field this node did not set.\n//\n// The widget signs nothing useful, so the gate here is a shared secret compared\n// in constant time. Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto on the instance.\nconst crypto = require('crypto');\n\nconst secret = $env.SUPPORT_WEBHOOK_SECRET;\nif (!secret) throw new Error('SUPPORT_WEBHOOK_SECRET is not set on this n8n instance');\n\nconst out = [];\n\nfor (const item of $input.all()) {\n  const headers = item.json.headers || {};\n  const presented = String(headers['x-support-secret'] || '');\n\n  const a = Buffer.from(presented.padEnd(secret.length, '\\0').slice(0, secret.length), 'utf8');\n  const b = Buffer.from(secret, 'utf8');\n  if (presented.length !== secret.length || !crypto.timingSafeEqual(a, b)) {\n    throw new Error('Inbound support webhook rejected: bad or missing x-support-secret');\n  }\n\n  const body = item.json.body || {};\n\n  const email = String(body.email || body.from || '').trim().toLowerCase();\n  const message = String(body.message || body.text || '').trim();\n\n  if (!email.includes('@')) throw new Error('Inbound message has no usable customer email');\n  if (!message) throw new Error('Inbound message is empty');\n\n  // Customers write \"#1042\", \"order 1042\", \"my order no. 1042\". Take the first\n  // 3+ digit run as a hint only - it is re-checked against the real order later.\n  const hint = message.match(/#?\\b(\\d{3,})\\b/);\n\n  out.push({\n    json: {\n      // Stable key for the decision log, so a retried delivery cannot double-log.\n      decision_key: String(body.message_id || body.conversation_id || '') + ':' + String(body.received_at || ''),\n      conversation_id: String(body.conversation_id || body.message_id || 'conv-' + Date.now()),\n      channel: String(body.channel || 'web_widget'),\n      customer_email: email,\n      customer_name: String(body.name || '').trim() || null,\n      message,\n      order_reference_hint: hint ? hint[1] : null,\n      received_at: body.received_at || new Date().toISOString(),\n    },\n  });\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -500,
+        300
+      ],
+      "id": "a1000001-0002-4a1b-9c2d-000000000002",
+      "name": "Normalise Inbound"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.LLM_API_BASE }}/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"{{ $env.LLM_MODEL }}\",\n  \"temperature\": 0,\n  \"max_tokens\": 300,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are the intent classifier for a WooCommerce store support inbox.\\nClassify the customer message into exactly one intent and return JSON only.\\n\\nconfidence is your own calibrated probability that the intent is correct.\\nBe conservative: if the message mixes topics, is ambiguous, is angry, or you\\ncannot tell what the customer wants, return a confidence below 0.6.\\n\\ntouches_money must be true for anything that could move money or change an\\norder: refunds, chargebacks, cancellations, discount requests, price disputes,\\nduplicate charges, or a request to change a paid order.\\n\\norder_reference is the order number if the customer gives one, else null.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": {{ JSON.stringify($json.message) }}\n    }\n  ],\n  \"response_format\": {\n    \"type\": \"json_schema\",\n    \"json_schema\": {\n      \"name\": \"support_intent\",\n      \"strict\": true,\n      \"schema\": {\n        \"type\": \"object\",\n        \"additionalProperties\": false,\n        \"required\": [\n          \"intent\",\n          \"confidence\",\n          \"order_reference\",\n          \"touches_money\",\n          \"summary\",\n          \"language\"\n        ],\n        \"properties\": {\n          \"intent\": {\n            \"type\": \"string\",\n            \"enum\": [\n              \"order_status\",\n              \"refund\",\n              \"product_question\",\n              \"complaint\",\n              \"other\"\n            ]\n          },\n          \"confidence\": {\n            \"type\": \"number\",\n            \"minimum\": 0,\n            \"maximum\": 1\n          },\n          \"order_reference\": {\n            \"type\": [\n              \"string\",\n              \"null\"\n            ]\n          },\n          \"touches_money\": {\n            \"type\": \"boolean\"\n          },\n          \"summary\": {\n            \"type\": \"string\"\n          },\n          \"language\": {\n            \"type\": \"string\"\n          }\n        }\n      }\n    }\n  }\n}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -280,
+        300
+      ],
+      "id": "a1000001-0003-4a1b-9c2d-000000000003",
+      "name": "Classify Intent",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": null,
+          "name": "LLM API Key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "OpenAI-compatible chat completion with response_format json_schema, strict: true. Any provider that speaks the same shape (OpenAI, Azure OpenAI, Groq, a local vLLM) is a change of LLM_API_BASE, not a change of workflow."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// One webhook delivery is one customer message, so .first() is the whole batch.\n// The model is asked for strict JSON. It is still parsed defensively: a model\n// that returns prose, a truncated object, or an intent outside the enum must\n// end up in the human queue, never in an auto-reply.\nconst inbound = $('Normalise Inbound').first().json;\nconst response = $input.first().json;\n\nconst ALLOWED = ['order_status', 'refund', 'product_question', 'complaint', 'other'];\n\nlet parsed = null;\nlet parseError = null;\n\ntry {\n  const content = response?.choices?.[0]?.message?.content;\n  if (typeof content !== 'string') throw new Error('no message content in the LLM response');\n  parsed = JSON.parse(content);\n} catch (e) {\n  parseError = e.message;\n}\n\nconst refusal = response?.choices?.[0]?.message?.refusal || null;\nif (refusal) parseError = 'model refused: ' + refusal;\n\nconst intent = ALLOWED.includes(parsed?.intent) ? parsed.intent : 'other';\n\nlet confidence = Number(parsed?.confidence);\nif (!Number.isFinite(confidence)) confidence = 0;\nconfidence = Math.min(1, Math.max(0, confidence));\nif (parseError || !ALLOWED.includes(parsed?.intent)) confidence = 0;\n\n// The model's own money flag is trusted only in the direction that adds\n// caution. A keyword sweep can raise it; nothing can lower it.\nconst MONEY_WORDS = /refund|chargeback|charged|charge|money back|cancel|invoice|discount|coupon|double.?bill|overcharg/i;\nconst touches_money = Boolean(parsed?.touches_money) || MONEY_WORDS.test(inbound.message) ||\n  intent === 'refund';\n\nreturn [\n  {\n    json: {\n      ...inbound,\n      intent,\n      confidence,\n      touches_money,\n      summary: String(parsed?.summary || '').slice(0, 400) || inbound.message.slice(0, 400),\n      language: String(parsed?.language || 'en').slice(0, 16),\n      order_reference: parsed?.order_reference ? String(parsed.order_reference) : inbound.order_reference_hint,\n      classifier_model: response?.model || $env.LLM_MODEL || null,\n      classifier_error: parseError,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -60,
+        300
+      ],
+      "id": "a1000001-0004-4a1b-9c2d-000000000004",
+      "name": "Parse Classification"
+    },
+    {
+      "parameters": {
+        "looseTypeValidation": true,
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-0001-4a1b-9c2d-000000000000",
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "order_status",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "order_status"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-0002-4a1b-9c2d-000000000000",
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "product_question",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "product_question"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "straight_to_human"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        160,
+        300
+      ],
+      "id": "a1000001-0005-4a1b-9c2d-000000000005",
+      "name": "Route Intent",
+      "notes": "refund, complaint and other never reach an answering branch at all - they go straight to the queue. Only the two intents with a grounded source of truth get a chance at an auto-reply."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.WOO_API_BASE }}/orders",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "search",
+              "value": "={{ $json.customer_email }}"
+            },
+            {
+              "name": "per_page",
+              "value": "10"
+            },
+            {
+              "name": "orderby",
+              "value": "date"
+            },
+            {
+              "name": "order",
+              "value": "desc"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          },
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        400,
+        140
+      ],
+      "id": "a1000001-0006-4a1b-9c2d-000000000006",
+      "name": "WooCommerce: Find Orders",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": null,
+          "name": "WooCommerce REST API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "An empty WooCommerce list is a normal answer, not an error - and a node that emits zero items silently ends the branch (alwaysOutputData does not help: n8n only applies it when the node has no outputs at all, and this one has an error output). Full Response guarantees exactly one item, so \"no orders\" is a state the workflow can see and act on."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// WooCommerce order search is a substring search across a lot of fields, so a\n// result is not proof of ownership. Nothing about an order is disclosed until\n// the billing email on that order matches the address the message came from.\nconst ctx = $('Parse Classification').first().json;\n\n// Full Response is on, so this is always exactly one item: the list, however\n// short, plus the status code.\nconst orders = ($input.first().json.body || []).filter((o) => o && o.id);\n\nconst wanted = ctx.order_reference ? String(ctx.order_reference) : null;\n\nconst owned = orders.filter(\n  (o) => String(o?.billing?.email || '').trim().toLowerCase() === ctx.customer_email,\n);\n\nlet order = null;\nif (wanted) order = owned.find((o) => String(o.id) === wanted || String(o.number) === wanted) || null;\nif (!order && !wanted) order = owned[0] || null;\n\nif (!order) {\n  // No auto-reply. Either the reference belongs to somebody else's order or the\n  // customer wrote from a different address than they ordered with - both are\n  // things a human should look at, and neither is a safe guess.\n  return [\n    {\n      json: {\n        ...ctx,\n        confidence: 0,\n        gate_reason: wanted\n          ? 'order ' + wanted + ' is not on file for ' + ctx.customer_email\n          : 'no orders on file for ' + ctx.customer_email,\n        reply_text: null,\n        reply_source: 'order_lookup',\n      },\n    },\n  ];\n}\n\nconst money = (v) => (order.currency_symbol || order.currency || '') + Number(v || 0).toFixed(2);\nconst lines = (order.line_items || [])\n  .map((li) => '  - ' + li.quantity + ' x ' + li.name + ' (' + money(li.total) + ')')\n  .join('\\n');\n\nconst tracking = (order.meta_data || []).find((m) => /tracking/i.test(m.key || ''));\nconst shipped = ['completed'].includes(order.status);\n\nconst text = [\n  'Hi ' + ((order.billing && order.billing.first_name) || 'there') + ',',\n  '',\n  'Order #' + order.number + ' placed on ' + String(order.date_created).slice(0, 10) +\n    ' is currently *' + String(order.status).replace(/-/g, ' ') + '*.',\n  '',\n  lines,\n  '',\n  'Order total: ' + money(order.total),\n  tracking ? 'Tracking: ' + tracking.value : (shipped ? 'Tracking will follow by email.' : ''),\n  '',\n  'Anything else I can check for you?',\n]\n  .filter(Boolean)\n  .join('\\n');\n\nreturn [\n  {\n    json: {\n      ...ctx,\n      // The reply is assembled from fields read out of WooCommerce a second\n      // ago, so the answer cannot drift from the store's own state.\n      reply_text: text,\n      reply_source: 'woocommerce_order',\n      order_id: order.id,\n      order_number: order.number,\n      order_status: order.status,\n      order_total: order.total,\n      gate_reason: null,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        620,
+        140
+      ],
+      "id": "a1000001-0007-4a1b-9c2d-000000000007",
+      "name": "Verify Order Ownership"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Deliberately not a vector store. Twenty-odd store policies fit in memory, the\n// retrieval is deterministic, there is no embedding bill and no index to keep in\n// sync with the store. Swap this node for a Vector Store node when the corpus\n// outgrows a page - the contract downstream (passages + retrieval_score) is the\n// same either way.\nconst ctx = $('Parse Classification').first().json;\n\nconst FAQ = [\n  { id: 'shipping-times', title: 'Shipping times', text: 'UK orders ship within 1 working day and arrive in 2-3 working days. EU orders take 5-8 working days. Rest of world 10-14 working days. Orders placed after 2pm Friday ship the next Monday.' },\n  { id: 'shipping-cost', title: 'Shipping cost', text: 'UK delivery is 3.95 GBP and free over 40 GBP. EU delivery is 9.95 GBP. Tracked shipping is included on every order over 40 GBP.' },\n  { id: 'returns', title: 'Returns policy', text: 'Unopened items can be returned within 30 days for a full refund. Opened coffee and tea cannot be returned for hygiene reasons unless the item is faulty. Return postage is paid by the customer unless the item arrived damaged.' },\n  { id: 'freshness', title: 'Roast date and freshness', text: 'Every bag is roasted to order and shows a roast date, not a best before date. Beans are at their best between 7 and 35 days after roasting. Store them sealed, at room temperature, away from light.' },\n  { id: 'grind', title: 'Grind options', text: 'Choose whole bean, filter, cafetiere or espresso grind at checkout. Whole bean keeps its flavour longest. We cannot change the grind once an order has been packed.' },\n  { id: 'subscriptions', title: 'Subscriptions', text: 'Subscriptions renew every 2, 4 or 6 weeks and can be paused, skipped or cancelled from the account area at any time before the renewal date. Subscribers get 10 percent off and free UK shipping.' },\n  { id: 'decaf', title: 'Decaf process', text: 'Our decaf is Swiss Water processed, so it is chemical free and retains 99.9 percent caffeine free status.' },\n  { id: 'origins', title: 'Origins and sourcing', text: 'We buy from named farms and cooperatives in Ethiopia, Colombia, Brazil, Rwanda and Guatemala, and publish the price paid to the producer on every product page.' },\n  { id: 'wholesale', title: 'Wholesale', text: 'Cafes and offices can open a wholesale account for orders over 5kg a month, with invoice terms and next day delivery.' },\n  { id: 'gift', title: 'Gift orders and notes', text: 'Add a gift note at checkout and we will include a handwritten card. Prices are never shown on the packing slip for gift orders.' },\n  { id: 'allergens', title: 'Allergens', text: 'Coffee and tea are packed in a facility that also handles milk powder and nuts for our hot chocolate range.' },\n  { id: 'payment', title: 'Payment methods', text: 'We accept all major cards, Apple Pay, Google Pay, PayPal and Klarna. Payment is taken when the order is placed.' },\n];\n\nconst STOP = new Set('a an and are as at be but by do does for from how i in is it its my me of on or our so that the their them then there these this to us was we what when where which who why will with you your'.split(' '));\n\nfunction tokens(s) {\n  return String(s).toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\\s+/).filter((t) => t.length > 2 && !STOP.has(t));\n}\n\nconst qSet = new Set(tokens(ctx.message));\n\nconst indexed = FAQ.map((entry) => ({ ...entry, terms: new Set(tokens(entry.title + ' ' + entry.text)) }));\nconst vocabulary = new Set(indexed.flatMap((e) => [...e.terms]));\n\n// Terms the corpus has never heard of are not evidence of a bad match - the\n// store simply has no word for \"EU\" or for the customer's name. They are\n// excluded from the denominator, but counted as a penalty, because a question\n// that is mostly unknown vocabulary is a question this corpus cannot answer.\nconst known = [...qSet].filter((t) => vocabulary.has(t));\nconst familiarity = qSet.size ? known.length / qSet.size : 0;\n\nconst scored = indexed\n  .map((entry) => {\n    const overlap = known.filter((t) => entry.terms.has(t)).length;\n    const coverage = known.length ? overlap / known.length : 0;\n    return { ...entry, overlap, score: coverage * (0.5 + 0.5 * familiarity) };\n  })\n  .sort((a, b) => b.score - a.score);\n\n// One matching word is a coincidence. Two is a match.\nconst top = scored.filter((s) => s.overlap >= 2).slice(0, 2);\nconst retrievalScore = top.length ? top[0].score : 0;\n\n// Two independent reasons to hand over: the classifier was unsure, or the store\n// simply has no policy that answers this. min() means either one is enough.\nconst confidence = Math.min(ctx.confidence, retrievalScore >= 0.5 ? 0.95 : retrievalScore);\n\nconst text = top.length\n  ? [\n      'Hi ' + (ctx.customer_name || 'there') + ',',\n      '',\n      top.map((t) => t.text).join('\\n\\n'),\n      '',\n      'If that does not cover it, just reply here and one of us will pick it up.',\n    ].join('\\n')\n  : null;\n\nreturn [\n  {\n    json: {\n      ...ctx,\n      confidence,\n      reply_text: text,\n      reply_source: 'faq_keyword_retrieval',\n      retrieval_score: Number(retrievalScore.toFixed(3)),\n      retrieved_passages: top.map((t) => t.id),\n      gate_reason: top.length ? null : 'no FAQ passage matched the question',\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        340
+      ],
+      "id": "a1000001-0008-4a1b-9c2d-000000000008",
+      "name": "Answer From Product FAQ"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Reached from the error output of every tool call in this workflow. A tool that\n// is down must not turn into a confident-sounding guess, and must not turn into\n// silence either - it becomes a human queue item with the failure attached.\nconst ctx = $('Normalise Inbound').first().json;\nconst failure = $input.first().json;\n\nconst error = failure?.error || failure;\nconst message = error?.message || error?.description || 'tool call failed with no message';\n\nreturn [\n  {\n    json: {\n      ...ctx,\n      intent: $('Parse Classification').isExecuted ? $('Parse Classification').first().json.intent : 'other',\n      confidence: 0,\n      touches_money: $('Parse Classification').isExecuted\n        ? $('Parse Classification').first().json.touches_money\n        : true,\n      reply_text: null,\n      reply_source: 'tool_failure',\n      gate_reason: 'tool call failed: ' + String(message).slice(0, 300),\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        560
+      ],
+      "id": "a1000001-0009-4a1b-9c2d-000000000009",
+      "name": "Escalate Tool Failure"
+    },
+    {
+      "parameters": {
+        "looseTypeValidation": true,
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-0003-4a1b-9c2d-000000000000",
+              "leftValue": "={{ $json.reply_text }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "exists",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "cond-0004-4a1b-9c2d-000000000000",
+              "leftValue": "={{ $json.confidence }}",
+              "rightValue": "={{ Number($env.SUPPORT_CONFIDENCE_THRESHOLD) }}",
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            },
+            {
+              "id": "cond-0005-4a1b-9c2d-000000000000",
+              "leftValue": "={{ $json.touches_money }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        860,
+        240
+      ],
+      "id": "a1000001-0010-4a1b-9c2d-000000000010",
+      "name": "Confidence Gate",
+      "notes": "Three conditions, all required: there is a grounded answer, the classifier was confident enough, and the message does not touch money. Anything else is a handover. The threshold is an env var so it can be tightened in production without touching the workflow."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPPORT_API_BASE }}/conversations/{{ $json.conversation_id }}/reply",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ to: $json.customer_email, body: $json.reply_text, source: $json.reply_source, automated: true }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1100,
+        140
+      ],
+      "id": "a1000001-0011-4a1b-9c2d-000000000011",
+      "name": "Send Auto Reply",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Everything the person picking this up needs, in the message itself: what was\n// asked, what the agent thought, and exactly why it refused to answer.\nconst c = $input.first().json;\n\nconst reason = c.gate_reason\n  || (c.touches_money ? 'touches money - policy is that a human answers' : null)\n  || 'confidence ' + c.confidence + ' is below the threshold ' + ($env.SUPPORT_CONFIDENCE_THRESHOLD || '0.75');\n\nreturn [\n  {\n    json: {\n      ...c,\n      review_reason: reason,\n      slack_payload: {\n        text: 'Support message needs a human: ' + c.customer_email,\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: 'Support handover - ' + c.intent } },\n          {\n            type: 'section',\n            fields: [\n              { type: 'mrkdwn', text: '*Customer*\\n' + c.customer_email },\n              { type: 'mrkdwn', text: '*Intent*\\n' + c.intent + ' (' + c.confidence + ')' },\n              { type: 'mrkdwn', text: '*Touches money*\\n' + (c.touches_money ? 'yes' : 'no') },\n              { type: 'mrkdwn', text: '*Channel*\\n' + c.channel },\n            ],\n          },\n          { type: 'section', text: { type: 'mrkdwn', text: '*Message*\\n' + String(c.message).slice(0, 2500) } },\n          { type: 'context', elements: [{ type: 'mrkdwn', text: 'Held because: ' + reason }] },\n        ],\n      },\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        400
+      ],
+      "id": "a1000001-0012-4a1b-9c2d-000000000012",
+      "name": "Build Handover Payload"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_HUMAN_REVIEW_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slack_payload) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1320,
+        400
+      ],
+      "id": "a1000001-0013-4a1b-9c2d-000000000013",
+      "name": "Queue For Human Review",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// One row per decision, whichever way the gate went. The auto branch records\n// what was sent so a bad reply can be traced back to the classification that\n// produced it.\nconst c = $('Confidence Gate').first().json;\nconst delivery = $input.first().json;\n\nreturn [\n  {\n    json: {\n      decision_key: c.decision_key,\n      conversation_id: c.conversation_id,\n      customer_email: c.customer_email,\n      channel: c.channel,\n      intent: c.intent,\n      confidence: c.confidence,\n      touches_money: c.touches_money,\n      action: 'auto_replied',\n      reply_source: c.reply_source,\n      reply_text: c.reply_text,\n      gate_reason: null,\n      classifier_model: c.classifier_model || null,\n      classifier_error: c.classifier_error || null,\n      external_ref: delivery?.id || delivery?.message_id || null,\n      execution_id: $execution.id,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        140
+      ],
+      "id": "a1000001-0014-4a1b-9c2d-000000000014",
+      "name": "Build Decision Row (Auto)"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const c = $('Build Handover Payload').first().json;\nconst delivery = $input.first().json;\nconst slackFailed = Boolean(delivery?.error);\n\nreturn [\n  {\n    json: {\n      decision_key: c.decision_key,\n      conversation_id: c.conversation_id,\n      customer_email: c.customer_email,\n      channel: c.channel,\n      intent: c.intent,\n      confidence: c.confidence,\n      touches_money: c.touches_money,\n      action: 'human_review',\n      reply_source: c.reply_source,\n      reply_text: null,\n      gate_reason: c.review_reason,\n      classifier_model: c.classifier_model || null,\n      classifier_error: c.classifier_error || null,\n      // A Slack outage must not lose the handover: the row is written either\n      // way and the queue table is the source of truth, not the Slack message.\n      external_ref: slackFailed ? 'slack_delivery_failed' : 'slack_notified',\n      execution_id: $execution.id,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        400
+      ],
+      "id": "a1000001-0015-4a1b-9c2d-000000000015",
+      "name": "Build Decision Row (Human)"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO human_review_queue\n  (decision_key, conversation_id, customer_email, channel, intent, confidence,\n   touches_money, reason, customer_message, execution_id)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\nON CONFLICT (decision_key) DO NOTHING\nRETURNING id, status;",
+        "options": {
+          "queryReplacement": "={{ [ $json.decision_key, $json.conversation_id, $json.customer_email, $json.channel, $json.intent, $json.confidence, $json.touches_money, $json.gate_reason, $('Build Handover Payload').item.json.message, $json.execution_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1760,
+        400
+      ],
+      "id": "a1000001-0016-4a1b-9c2d-000000000016",
+      "name": "Open Review Ticket",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - ecommerce ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "notes": "The queue table is the source of truth for a handover, not the Slack message. ON CONFLICT on decision_key means a redelivered webhook cannot open the same ticket twice."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO support_decisions\n  (decision_key, conversation_id, customer_email, channel, intent, confidence,\n   touches_money, action, reply_source, reply_text, gate_reason,\n   classifier_model, classifier_error, external_ref, execution_id)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)\nON CONFLICT (decision_key) DO NOTHING\nRETURNING id, action, created_at;",
+        "options": {
+          "queryReplacement": "={{ [ $json.decision_key, $json.conversation_id, $json.customer_email, $json.channel, $json.intent, $json.confidence, $json.touches_money, $json.action, $json.reply_source, $json.reply_text, $json.gate_reason, $json.classifier_model, $json.classifier_error, $json.external_ref, $json.execution_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1980,
+        260
+      ],
+      "id": "a1000001-0017-4a1b-9c2d-000000000017",
+      "name": "Log Decision",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - ecommerce ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "notes": "Every decision, both branches, one row. This table is what you read when a client asks \"why did the bot say that\" - and what you group by to decide whether the threshold can be lowered."
+    }
+  ],
+  "connections": {
+    "Support Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalise Inbound",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise Inbound": {
+      "main": [
+        [
+          {
+            "node": "Classify Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Intent": {
+      "main": [
+        [
+          {
+            "node": "Parse Classification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Escalate Tool Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Classification": {
+      "main": [
+        [
+          {
+            "node": "Route Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Intent": {
+      "main": [
+        [
+          {
+            "node": "WooCommerce: Find Orders",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Answer From Product FAQ",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Handover Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WooCommerce: Find Orders": {
+      "main": [
+        [
+          {
+            "node": "Verify Order Ownership",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Escalate Tool Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Order Ownership": {
+      "main": [
+        [
+          {
+            "node": "Confidence Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer From Product FAQ": {
+      "main": [
+        [
+          {
+            "node": "Confidence Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalate Tool Failure": {
+      "main": [
+        [
+          {
+            "node": "Build Handover Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confidence Gate": {
+      "main": [
+        [
+          {
+            "node": "Send Auto Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Handover Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Auto Reply": {
+      "main": [
+        [
+          {
+            "node": "Build Decision Row (Auto)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Escalate Tool Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Handover Payload": {
+      "main": [
+        [
+          {
+            "node": "Queue For Human Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Queue For Human Review": {
+      "main": [
+        [
+          {
+            "node": "Build Decision Row (Human)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Decision Row (Human)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Decision Row (Auto)": {
+      "main": [
+        [
+          {
+            "node": "Log Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Decision Row (Human)": {
+      "main": [
+        [
+          {
+            "node": "Open Review Ticket",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "REPLACE_WITH_WORKFLOW_04_ID",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "timezone": "Europe/London",
+    "executionTimeout": 300
+  },
+  "pinData": {}
+}

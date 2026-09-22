@@ -1,0 +1,133 @@
+{
+  "name": "04 - Error Trigger Alerts",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -420,
+        300
+      ],
+      "id": "a4000004-0001-4a1b-9c2d-000000000001",
+      "name": "Error Trigger",
+      "notes": "Set as the Error Workflow on every other workflow in this repo (Workflow settings > Error workflow). It fires once per failed execution, including failed retries."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The Error Trigger receives one item describing the failed execution:\n//   { execution: { id, url, error, lastNodeExecuted, mode, retryOf },\n//     workflow:  { id, name } }\n// A workflow that fails before any node runs sends { trigger: { error } }.\nconst payload = $input.first().json;\n\nconst workflow = payload.workflow || {};\nconst execution = payload.execution || {};\nconst trigger = payload.trigger || {};\nconst error = execution.error || trigger.error || {};\n\nconst failedNode = error?.node?.name || execution.lastNodeExecuted || 'trigger / before first node';\nconst message = error.message || 'n8n supplied no error message';\n\n// The item that was in flight when the node threw is the most useful thing in\n// the whole alert, and the thing nobody thinks to include.\nconst context = error.context || {};\nconst excerpt = JSON.stringify(context.data ?? context ?? {}).slice(0, 900);\n\nreturn [\n  {\n    json: {\n      workflow_id: workflow.id || null,\n      workflow_name: workflow.name || 'unknown',\n      execution_id: execution.id || null,\n      execution_url: execution.url || null,\n      failed_node: failedNode,\n      error_name: error.name || 'Error',\n      error_message: message,\n      error_description: error.description || null,\n      error_stack: String(error.stack || '').slice(0, 2000) || null,\n      execution_mode: execution.mode || null,\n      retry_of: execution.retryOf || null,\n      input_excerpt: excerpt,\n      occurred_at: new Date().toISOString(),\n      slack_payload: {\n        text: 'n8n workflow failed: ' + (workflow.name || 'unknown'),\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: 'n8n workflow failed' } },\n          {\n            type: 'section',\n            fields: [\n              { type: 'mrkdwn', text: '*Workflow*\\n' + (workflow.name || 'unknown') },\n              { type: 'mrkdwn', text: '*Failing node*\\n' + failedNode },\n              { type: 'mrkdwn', text: '*Execution*\\n' + (execution.id || 'n/a') },\n              { type: 'mrkdwn', text: '*Mode*\\n' + (execution.mode || 'unknown') },\n            ],\n          },\n          { type: 'section', text: { type: 'mrkdwn', text: '*Error*\\n' + String(message).slice(0, 1500) } },\n          { type: 'section', text: { type: 'mrkdwn', text: '*Item in flight*\\n' + excerpt } },\n          {\n            type: 'context',\n            elements: [\n              {\n                type: 'mrkdwn',\n                text: execution.url\n                  ? 'Open the execution: ' + execution.url\n                  : 'Manual execution - no permalink',\n              },\n            ],\n          },\n        ],\n      },\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        300
+      ],
+      "id": "a4000004-0002-4a1b-9c2d-000000000002",
+      "name": "Format Alert"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_ALERTS_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slack_payload) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        20,
+        300
+      ],
+      "id": "a4000004-0003-4a1b-9c2d-000000000003",
+      "name": "Alert Ops Channel",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO workflow_failures\n  (workflow_id, workflow_name, execution_id, execution_url, failed_node,\n   error_name, error_message, error_description, error_stack, execution_mode,\n   retry_of, input_excerpt, alert_delivered)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)\nON CONFLICT (execution_id) WHERE execution_id IS NOT NULL DO NOTHING\nRETURNING id, workflow_name, failed_node;",
+        "options": {
+          "queryReplacement": "={{ [ $('Format Alert').item.json.workflow_id, $('Format Alert').item.json.workflow_name, $('Format Alert').item.json.execution_id, $('Format Alert').item.json.execution_url, $('Format Alert').item.json.failed_node, $('Format Alert').item.json.error_name, $('Format Alert').item.json.error_message, $('Format Alert').item.json.error_description, $('Format Alert').item.json.error_stack, $('Format Alert').item.json.execution_mode, $('Format Alert').item.json.retry_of, $('Format Alert').item.json.input_excerpt, !$json.error ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        260,
+        300
+      ],
+      "id": "a4000004-0004-4a1b-9c2d-000000000004",
+      "name": "Record Failure",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - ecommerce ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "notes": "Written whether or not Slack accepted the message, with alert_delivered recording which. A failures table that only contains the failures you were successfully told about is not a failures table."
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Format Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Alert": {
+      "main": [
+        [
+          {
+            "node": "Alert Ops Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Ops Channel": {
+      "main": [
+        [
+          {
+            "node": "Record Failure",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "timezone": "Europe/London",
+    "executionTimeout": 120
+  },
+  "pinData": {}
+}

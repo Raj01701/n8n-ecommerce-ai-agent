@@ -1,0 +1,664 @@
+{
+  "name": "02 - Order Lifecycle",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "woocommerce/order-events",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true,
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -780,
+        300
+      ],
+      "id": "a2000002-0001-4a1b-9c2d-000000000001",
+      "name": "WooCommerce Order Webhook",
+      "webhookId": "a2000002-0001-4a1b-9c2d-orderevents1",
+      "notes": "Point WooCommerce > Settings > Advanced > Webhooks at this URL for the order.created and order.updated topics. Raw Body is on because the signature is over the exact bytes sent."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// WooCommerce signs every webhook delivery: x-wc-webhook-signature is the\n// base64 HMAC-SHA256 of the exact request body, keyed with the secret set on\n// the webhook in WooCommerce > Settings > Advanced > Webhooks.\n//\n// The Webhook node runs with Raw Body on, so the bytes WooCommerce signed are\n// in binary.data. Re-serialising the parsed JSON would reorder keys and the\n// HMAC would never match.\nconst crypto = require('crypto');\n\nconst secret = $env.WOO_WEBHOOK_SECRET;\nif (!secret) throw new Error('WOO_WEBHOOK_SECRET is not set on this n8n instance');\n\nconst item = $input.first();\nconst headers = item.json.headers || {};\n\nconst rawBody = item.binary?.data?.data\n  ? Buffer.from(item.binary.data.data, 'base64').toString('utf8')\n  : JSON.stringify(item.json.body || {});\n\nconst presented = String(headers['x-wc-webhook-signature'] || '');\nconst expected = crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest('base64');\n\nconst a = Buffer.from(expected, 'utf8');\nconst b = Buffer.from(presented, 'utf8');\nif (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {\n  throw new Error('WooCommerce webhook signature did not match - delivery rejected');\n}\n\nconst topic = String(headers['x-wc-webhook-topic'] || 'order.updated');\n// WooCommerce retries a delivery it did not get a 2xx for, with the same\n// delivery id. That id is what makes this pipeline safe to retry.\nconst deliveryId = String(headers['x-wc-webhook-delivery-id'] || headers['x-wc-webhook-id'] || '');\nif (!deliveryId) throw new Error('WooCommerce delivery has no id - cannot deduplicate it');\n\nconst order = JSON.parse(rawBody);\nif (!order.id) throw new Error('Webhook body is not an order');\n\nreturn [\n  {\n    json: {\n      delivery_id: deliveryId,\n      topic,\n      order_id: order.id,\n      order_number: String(order.number || order.id),\n      status: String(order.status || 'pending'),\n      currency: order.currency || $env.STORE_CURRENCY || 'GBP',\n      total: Number(order.total || 0),\n      date_created: order.date_created || null,\n      payment_method_title: order.payment_method_title || null,\n      payment_url: order.payment_url || null,\n      customer_id: order.customer_id || 0,\n      customer_email: String(order.billing?.email || '').trim().toLowerCase(),\n      customer_name: [order.billing?.first_name, order.billing?.last_name].filter(Boolean).join(' '),\n      line_items: (order.line_items || []).map((li) => ({\n        product_id: li.product_id,\n        name: li.name,\n        quantity: li.quantity,\n        total: Number(li.total || 0),\n      })),\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -560,
+        300
+      ],
+      "id": "a2000002-0002-4a1b-9c2d-000000000002",
+      "name": "Verify Woo Signature"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO processed_webhooks (source, delivery_id, topic, reference)\nVALUES ('woocommerce', $1, $2, $3)\nON CONFLICT (source, delivery_id) DO NOTHING\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.delivery_id, $json.topic, $json.order_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -340,
+        300
+      ],
+      "id": "a2000002-0003-4a1b-9c2d-000000000003",
+      "name": "Claim Delivery",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - ecommerce ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "alwaysOutputData": true,
+      "notes": "The unique constraint is the lock. A prior SELECT would race two concurrent deliveries of the same event; an INSERT ... ON CONFLICT cannot. alwaysOutputData is on because a duplicate returns zero rows and the IF below still has to run."
+    },
+    {
+      "parameters": {
+        "looseTypeValidation": true,
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-0006-4a1b-9c2d-000000000000",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "number",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -120,
+        300
+      ],
+      "id": "a2000002-0004-4a1b-9c2d-000000000004",
+      "name": "First Delivery?"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        100,
+        480
+      ],
+      "id": "a2000002-0005-4a1b-9c2d-000000000005",
+      "name": "Duplicate Delivery",
+      "notes": "WooCommerce retried a delivery it already got a 200 for. Ending here is the correct behaviour - and it is visible in the execution list rather than silent."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.WOO_API_BASE }}/orders",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "search",
+              "value": "={{ $('Verify Woo Signature').first().json.customer_email }}"
+            },
+            {
+              "name": "per_page",
+              "value": "100"
+            },
+            {
+              "name": "status",
+              "value": "completed,processing"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          },
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        100,
+        200
+      ],
+      "id": "a2000002-0006-4a1b-9c2d-000000000006",
+      "name": "WooCommerce: Customer History",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": null,
+          "name": "WooCommerce REST API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "Guest checkouts have customer_id 0, so history is matched on the billing email rather than the WooCommerce customer id - otherwise every guest order looks like a first order. An empty WooCommerce list is a normal answer, not an error - and a node that emits zero items silently ends the branch (alwaysOutputData does not help: n8n only applies it when the node has no outputs at all, and this one has an error output). Full Response guarantees exactly one item, so \"no orders\" is a state the workflow can see and act on."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Reached from the error output of the history lookup. The order still\n// has to be handled, so one marker item is emitted and Enrich Customer\n// treats the customer as unknown rather than as new. Dropping the order\n// here would be the silent failure this whole design exists to avoid.\nreturn [{ json: { history_unavailable: true } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        420
+      ],
+      "id": "a2000002-0007-4a1b-9c2d-000000000007",
+      "name": "No History Available"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Two numbers decide everything downstream: how much this customer is worth,\n// and whether this is their first order. Both come from the store, not from a\n// CRM that may be a day behind.\nconst order = $('Verify Woo Signature').first().json;\nconst input = $input.all().map((i) => i.json);\n\n// Set by \"No History Available\" when the store's order list could not be read.\n// A first-time buyer legitimately has an empty history; a failed read does not,\n// and the two must not be confused.\nconst degraded = input.some((o) => o && o.history_unavailable);\nconst history = input.flatMap((o) => (Array.isArray(o?.body) ? o.body : [])).filter((o) => o && o.id);\n\n// The current order can already be in the history response. Counting it twice\n// would turn a first-time buyer into a returning one on their very first order.\nconst previous = history.filter((o) => String(o.id) !== String(order.order_id));\n\nconst paid = previous.filter((o) => ['completed', 'processing'].includes(o.status));\nconst lifetimeValue = paid.reduce((sum, o) => sum + Number(o.total || 0), 0);\nconst orderCount = paid.length;\n\nconst dates = paid.map((o) => new Date(o.date_created).getTime()).filter((t) => !Number.isNaN(t));\nconst firstOrderAt = dates.length ? new Date(Math.min(...dates)).toISOString() : null;\n\nconst threshold = Number($env.HIGH_VALUE_ORDER_THRESHOLD || 150);\nconst vipThreshold = Number($env.VIP_LIFETIME_VALUE_THRESHOLD || 500);\n\n// Degraded read: an unknown customer is not the same as a new one. Welcoming\n// somebody who has shopped here for three years is worse than not welcoming a\n// genuine new customer, so on a failed history read nobody gets welcomed.\nconst firstTimeBuyer = !degraded && orderCount === 0;\nconst recoverable = ['pending', 'failed', 'on-hold'].includes(order.status);\n\nreturn [\n  {\n    json: {\n      ...order,\n      lifetime_value: Number(lifetimeValue.toFixed(2)),\n      lifetime_value_incl_this: Number((lifetimeValue + order.total).toFixed(2)),\n      previous_order_count: orderCount,\n      average_order_value: orderCount ? Number((lifetimeValue / orderCount).toFixed(2)) : null,\n      first_order_at: firstOrderAt,\n      first_time_buyer: firstTimeBuyer,\n      high_value: order.total >= threshold || (!degraded && lifetimeValue + order.total >= vipThreshold),\n      payment_recoverable: recoverable,\n      segment: degraded ? 'unknown' : firstTimeBuyer ? 'new' : lifetimeValue >= vipThreshold ? 'vip' : 'returning',\n      history_degraded: degraded,\n      high_value_threshold: threshold,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        260
+      ],
+      "id": "a2000002-0008-4a1b-9c2d-000000000008",
+      "name": "Enrich Customer"
+    },
+    {
+      "parameters": {
+        "looseTypeValidation": true,
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-0007-4a1b-9c2d-000000000000",
+                    "leftValue": "={{ $json.payment_recoverable }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "payment_recovery"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-0008-4a1b-9c2d-000000000000",
+                    "leftValue": "={{ $json.high_value }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "high_value"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "cond-0009-4a1b-9c2d-000000000000",
+                    "leftValue": "={{ $json.first_time_buyer }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  },
+                  {
+                    "id": "cond-0010-4a1b-9c2d-000000000000",
+                    "leftValue": "={{ $json.payment_recoverable }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "false",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "first_time_buyer"
+            }
+          ]
+        },
+        "options": {
+          "allMatchingOutputs": true,
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "standard"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        760,
+        260
+      ],
+      "id": "a2000002-0009-4a1b-9c2d-000000000009",
+      "name": "Route Lifecycle",
+      "notes": "allMatchingOutputs is on, because a first order of 400 GBP is both a first-time buyer and a high-value order and deserves both. The welcome rule excludes unpaid orders so nobody is welcomed for an order that never got paid for."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.EMAIL_API_BASE }}/messages",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ template: 'payment_recovery', to: $json.customer_email, idempotency_key: 'recovery-' + $json.order_id, variables: { first_name: ($json.customer_name || '').split(' ')[0], order_number: $json.order_number, total: $json.currency + ' ' + $json.total.toFixed(2), pay_url: $json.payment_url } }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1040,
+        60
+      ],
+      "id": "a2000002-0010-4a1b-9c2d-000000000010",
+      "name": "Send Payment Recovery Nudge",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "idempotency_key is derived from the order id, so a replayed order.updated event cannot send the same customer two recovery emails even if the guard above is ever bypassed."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const c = $json;\nreturn [\n  {\n    json: {\n      ...c,\n      slack_payload: {\n        text: 'High-value order ' + c.order_number + ' - ' + c.currency + ' ' + c.total.toFixed(2),\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: 'High-value order #' + c.order_number } },\n          {\n            type: 'section',\n            fields: [\n              { type: 'mrkdwn', text: '*Value*\\n' + c.currency + ' ' + c.total.toFixed(2) },\n              { type: 'mrkdwn', text: '*Customer*\\n' + (c.customer_name || c.customer_email) },\n              { type: 'mrkdwn', text: '*Segment*\\n' + c.segment },\n              { type: 'mrkdwn', text: '*Lifetime value*\\n' + c.currency + ' ' + c.lifetime_value_incl_this.toFixed(2) },\n            ],\n          },\n          {\n            type: 'section',\n            text: {\n              type: 'mrkdwn',\n              text: '*Items*\\n' + c.line_items.map((li) => '- ' + li.quantity + ' x ' + li.name).join('\\n'),\n            },\n          },\n        ],\n      },\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        240
+      ],
+      "id": "a2000002-0011-4a1b-9c2d-000000000011",
+      "name": "Build High-Value Alert"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_SALES_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slack_payload) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1260,
+        240
+      ],
+      "id": "a2000002-0012-4a1b-9c2d-000000000012",
+      "name": "Alert Sales Channel",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.EMAIL_API_BASE }}/sequences/{{ $env.WELCOME_SEQUENCE_ID }}/subscribers",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ email: $json.customer_email, idempotency_key: 'welcome-' + $json.customer_email, fields: { first_name: ($json.customer_name || '').split(' ')[0], first_order_number: $json.order_number, first_order_total: $json.total, first_product: ($json.line_items[0] || {}).name || null } }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1040,
+        420
+      ],
+      "id": "a2000002-0013-4a1b-9c2d-000000000013",
+      "name": "Start Welcome Sequence",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "Keyed on the email, not the order, so a customer who somehow triggers two first orders is still only enrolled once."
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1040,
+        600
+      ],
+      "id": "a2000002-0014-4a1b-9c2d-000000000014",
+      "name": "No Action Needed"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Every branch ends here, success or failure, so the actions table is a\n// complete record of what the automation did to each order - including the\n// times it tried and could not.\nconst ctx = $('Enrich Customer').first().json;\nconst result = $input.first().json;\nconst failed = Boolean(result?.error);\n\n// Which branch called us. $prevNode is the node that produced this item.\nconst source = $prevNode.name;\nconst ACTION_BY_NODE = {\n  'Alert Sales Channel': 'high_value_alert',\n  'Start Welcome Sequence': 'welcome_sequence',\n  'Send Payment Recovery Nudge': 'payment_recovery_nudge',\n  'No Action Needed': 'none',\n};\n\nreturn [\n  {\n    json: {\n      delivery_id: ctx.delivery_id,\n      order_id: ctx.order_id,\n      order_number: ctx.order_number,\n      customer_email: ctx.customer_email,\n      segment: ctx.segment,\n      lifetime_value: ctx.lifetime_value_incl_this,\n      order_total: ctx.total,\n      order_status: ctx.status,\n      action: ACTION_BY_NODE[source] || source,\n      succeeded: !failed,\n      detail: failed\n        ? String(result?.error?.message || result?.error || 'unknown failure').slice(0, 500)\n        : null,\n      execution_id: $execution.id,\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        360
+      ],
+      "id": "a2000002-0015-4a1b-9c2d-000000000015",
+      "name": "Build Action Row"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO order_lifecycle_actions\n  (delivery_id, order_id, order_number, customer_email, segment, lifetime_value,\n   order_total, order_status, action, succeeded, detail, execution_id)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)\nON CONFLICT (delivery_id, action) DO NOTHING\nRETURNING id, action, succeeded;",
+        "options": {
+          "queryReplacement": "={{ [ $json.delivery_id, $json.order_id, $json.order_number, $json.customer_email, $json.segment, $json.lifetime_value, $json.order_total, $json.order_status, $json.action, $json.succeeded, $json.detail, $json.execution_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1740,
+        360
+      ],
+      "id": "a2000002-0016-4a1b-9c2d-000000000016",
+      "name": "Log Lifecycle Action",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Postgres - ecommerce ops"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500
+    }
+  ],
+  "connections": {
+    "WooCommerce Order Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify Woo Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Woo Signature": {
+      "main": [
+        [
+          {
+            "node": "Claim Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Delivery": {
+      "main": [
+        [
+          {
+            "node": "First Delivery?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "First Delivery?": {
+      "main": [
+        [
+          {
+            "node": "WooCommerce: Customer History",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Duplicate Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WooCommerce: Customer History": {
+      "main": [
+        [
+          {
+            "node": "Enrich Customer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No History Available",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "No History Available": {
+      "main": [
+        [
+          {
+            "node": "Enrich Customer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich Customer": {
+      "main": [
+        [
+          {
+            "node": "Route Lifecycle",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Lifecycle": {
+      "main": [
+        [
+          {
+            "node": "Send Payment Recovery Nudge",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build High-Value Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Start Welcome Sequence",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Action Needed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Payment Recovery Nudge": {
+      "main": [
+        [
+          {
+            "node": "Build Action Row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Action Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build High-Value Alert": {
+      "main": [
+        [
+          {
+            "node": "Alert Sales Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Sales Channel": {
+      "main": [
+        [
+          {
+            "node": "Build Action Row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Action Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start Welcome Sequence": {
+      "main": [
+        [
+          {
+            "node": "Build Action Row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Action Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "No Action Needed": {
+      "main": [
+        [
+          {
+            "node": "Build Action Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Action Row": {
+      "main": [
+        [
+          {
+            "node": "Log Lifecycle Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "REPLACE_WITH_WORKFLOW_04_ID",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "timezone": "Europe/London",
+    "executionTimeout": 300
+  },
+  "pinData": {}
+}

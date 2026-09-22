@@ -1,0 +1,13 @@
+{
+  "name": "n8n-ecommerce-ai-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-shaped n8n workflows for a WooCommerce store: an AI support agent with a confidence gate, order lifecycle automation, abandoned-cart and stock watch, and error alerting.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test test/validate.mjs",
+    "mocks": "node test/mocks/server.mjs"
+  },
+  "license": "MIT"
+}

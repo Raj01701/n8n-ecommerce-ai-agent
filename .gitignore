@@ -1,0 +1,14 @@
+# Real configuration. infra/.env.example is the documented template.
+.env
+infra/.env
+*.env.local
+
+# Local runtime artefacts
+node_modules/
+npm-debug.log*
+.DS_Store
+
+# Anything exported back out of a live instance - it carries instance ids
+# and, if exported with --decrypted, real credentials.
+exports/
+*.decrypted.json

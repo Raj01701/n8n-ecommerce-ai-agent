@@ -1,0 +1,191 @@
+########################################################################
+# Render Blueprint - deploys this stack on Render's free tier.
+#
+#   1. Fork this repo.
+#   2. Render dashboard > New > Blueprint > pick the fork.
+#   3. Render reads THIS file, creates a managed Postgres and a web
+#      service running the official n8n image, and asks you for the
+#      values marked "sync: false" below.
+#   4. After the first deploy, copy the service URL Render gives you
+#      (https://<name>.onrender.com) and set WEBHOOK_URL and
+#      N8N_EDITOR_BASE_URL to it, with a trailing slash. Redeploy.
+#   5. Open the URL, create the owner account, add the three credentials
+#      (see the README), then import the workflows.
+#
+# Honest limits of the free tier, so nothing here is a surprise:
+#   - The free web service sleeps after ~15 minutes with no traffic and
+#     takes 30-60s to wake. A sleeping instance does not run Schedule
+#     Triggers, so workflow 03 will miss its window. Webhooks still work
+#     (WooCommerce retries), but the first one after a sleep is slow.
+#     Anything with a real schedule needs the paid Starter instance.
+#   - Free Postgres is deleted after 30 days. Keep a pg_dump, or move to
+#     the paid tier before then.
+#   - Free instances have no persistent disk, which is why this blueprint
+#     puts everything in Postgres and mounts nothing.
+#
+# Railway and Koyeb take the same shape:
+#   Railway - New Project > Deploy from Docker image
+#             (docker.n8n.io/n8nio/n8n:2.40.5), add the Postgres plugin,
+#             copy the same env vars. No sleeping, usage-billed.
+#   Koyeb   - Create Service > Docker > same image, port 5678, attach a
+#             Koyeb managed Postgres or any external one. The free
+#             instance does not sleep, which makes it the better choice
+#             of the three if you need the schedule to actually run.
+########################################################################
+
+databases:
+  - name: n8n-ecom-db
+    databaseName: n8n
+    user: n8n
+    plan: free
+    postgresMajorVersion: "16"
+    ipAllowList: []          # internal connections only
+
+services:
+  - type: web
+    name: n8n-ecom-agent
+    runtime: image
+    plan: free
+    region: oregon
+    image:
+      url: docker.n8n.io/n8nio/n8n:2.40.5
+    healthCheckPath: /healthz
+    envVars:
+      # --- how n8n is reached ------------------------------------------
+      - key: N8N_PORT
+        value: "5678"
+      - key: N8N_LISTEN_ADDRESS
+        value: 0.0.0.0
+      - key: N8N_PROTOCOL
+        value: https
+      # Render terminates TLS one hop in front of the container.
+      - key: N8N_PROXY_HOPS
+        value: "1"
+      # Set both of these to https://<your-service>.onrender.com/ after the
+      # first deploy. Until then n8n will hand out webhook URLs that point
+      # at the container, and WooCommerce will never reach them.
+      - key: WEBHOOK_URL
+        sync: false
+      - key: N8N_EDITOR_BASE_URL
+        sync: false
+
+      # --- database -----------------------------------------------------
+      - key: DB_TYPE
+        value: postgresdb
+      - key: DB_POSTGRESDB_HOST
+        fromDatabase:
+          name: n8n-ecom-db
+          property: host
+      - key: DB_POSTGRESDB_PORT
+        fromDatabase:
+          name: n8n-ecom-db
+          property: port
+      - key: DB_POSTGRESDB_DATABASE
+        fromDatabase:
+          name: n8n-ecom-db
+          property: database
+      - key: DB_POSTGRESDB_USER
+        fromDatabase:
+          name: n8n-ecom-db
+          property: user
+      - key: DB_POSTGRESDB_PASSWORD
+        fromDatabase:
+          name: n8n-ecom-db
+          property: password
+      - key: DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED
+        value: "false"
+
+      # --- secrets ------------------------------------------------------
+      # Generated once by Render and never shown in this file. If you ever
+      # rebuild the service, copy the old value across or every stored
+      # credential becomes undecryptable.
+      - key: N8N_ENCRYPTION_KEY
+        generateValue: true
+      - key: SUPPORT_WEBHOOK_SECRET
+        generateValue: true
+      - key: WOO_WEBHOOK_SECRET
+        sync: false
+
+      # --- execution retention -----------------------------------------
+      - key: EXECUTIONS_DATA_PRUNE
+        value: "true"
+      # Free Postgres is 1 GB. Seven days of history is the honest setting.
+      - key: EXECUTIONS_DATA_MAX_AGE
+        value: "168"
+      - key: EXECUTIONS_DATA_PRUNE_MAX_COUNT
+        value: "5000"
+      - key: EXECUTIONS_DATA_SAVE_ON_SUCCESS
+        value: all
+      - key: EXECUTIONS_DATA_SAVE_ON_ERROR
+        value: all
+      - key: EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS
+        value: "true"
+
+      # --- Code node requirements --------------------------------------
+      - key: NODE_FUNCTION_ALLOW_BUILTIN
+        value: crypto
+      - key: N8N_BLOCK_ENV_ACCESS_IN_NODE
+        value: "false"
+
+      # --- store configuration ------------------------------------------
+      - key: STORE_NAME
+        sync: false
+      - key: STORE_CURRENCY
+        value: GBP
+      - key: WOO_API_BASE
+        sync: false
+      - key: SUPPORT_API_BASE
+        sync: false
+      - key: SUPPORT_CONFIDENCE_THRESHOLD
+        value: "0.75"
+      - key: LLM_API_BASE
+        value: https://api.openai.com/v1
+      - key: LLM_MODEL
+        value: gpt-4o-mini
+      - key: EMAIL_API_BASE
+        sync: false
+      - key: WELCOME_SEQUENCE_ID
+        value: welcome
+      - key: HIGH_VALUE_ORDER_THRESHOLD
+        value: "150"
+      - key: VIP_LIFETIME_VALUE_THRESHOLD
+        value: "500"
+      - key: ABANDONED_CART_MIN_AGE_HOURS
+        value: "4"
+      - key: ABANDONED_CART_MAX_AGE_HOURS
+        value: "48"
+      - key: LOW_STOCK_THRESHOLD
+        value: "5"
+
+      # --- slack incoming webhooks (secrets) ----------------------------
+      - key: SLACK_HUMAN_REVIEW_WEBHOOK_URL
+        sync: false
+      - key: SLACK_SALES_WEBHOOK_URL
+        sync: false
+      - key: SLACK_SUPPLIER_WEBHOOK_URL
+        sync: false
+      - key: SLACK_ALERTS_WEBHOOK_URL
+        sync: false
+
+      # --- housekeeping --------------------------------------------------
+      - key: GENERIC_TIMEZONE
+        value: Europe/London
+      - key: TZ
+        value: Europe/London
+      - key: N8N_DIAGNOSTICS_ENABLED
+        value: "false"
+      - key: N8N_HIRING_BANNER_ENABLED
+        value: "false"
+      - key: N8N_RUNNERS_ENABLED
+        value: "true"
+
+# NOTE: this blueprint creates ONE database and n8n uses it for its own
+# tables. The application tables in sql/schema.sql go in the same database
+# on the free tier - apply them once from your laptop with the external
+# connection string Render shows you:
+#
+#   psql "<external connection string>" -f sql/schema.sql
+#
+# On a paid plan, create a second database and point the "Postgres -
+# ecommerce ops" credential at that one instead, so n8n's own tables and
+# the audit trail can be backed up and restored independently.
