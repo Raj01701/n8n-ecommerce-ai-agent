@@ -446,3 +446,21 @@ test('every other workflow points its errorWorkflow at 04', () => {
     );
   }
 });
+
+test('a message with no upstream id gets a decision_key of its own', () => {
+  const node = parsed.get('01-support-agent.json').nodes.find((n) => n.name === 'Normalise Inbound');
+  const code = node.parameters.jsCode;
+
+  // The first version fell back to the empty string when the widget sent no
+  // message_id, so every such message keyed on ":" and the ON CONFLICT in the
+  // decision log dropped all but the first - while still auto-replying to them.
+  assert.ok(
+    !/decision_key:\s*String\(body\.message_id[^\n]*\|\|\s*''\)\s*\+/.test(code),
+    'an absent upstream id must not collapse to a shared decision_key',
+  );
+  assert.match(code, /createHash\('sha256'\)/, 'the id-less path must hash the message');
+  assert.ok(
+    /\[email, message, receivedAt\]/.test(code),
+    'the hash must cover sender, body and timestamp, or two customers can still collide',
+  );
+});

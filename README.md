@@ -174,6 +174,15 @@ guard is `INSERT ... ON CONFLICT ... DO NOTHING RETURNING`, with
 see. The cart nudge row is claimed *before* the email is sent: a crash between
 the two costs one missed email, which is much cheaper than a second one.
 
+**A dedupe key has to be unique, not merely present.** The first version of the
+support webhook built `decision_key` from `message_id` and fell back to the
+empty string, so every message from a widget that sends no id shared the key
+`":"`. `ON CONFLICT DO NOTHING` then discarded every decision after the first
+while the workflow still replied — a silent hole in the audit trail, with a
+green execution next to it. When there is no upstream id the key is now a
+SHA-256 of sender, body and `received_at`, so a replayed delivery still
+collides and two customers never do. A validator rule holds the shape.
+
 **Retries are on every external call**, with a gap between attempts — an
 immediate retry just hits the same failure.
 
@@ -242,11 +251,37 @@ after you have imported the file into a live instance:
 ```
 workflows/     the four workflow JSON files — import these
 infra/         docker-compose.yml, .env.example, render.yaml, db init
+scripts/       demo-up.sh / demo-down.sh — the whole stack in one command
 sql/schema.sql decision log, human review queue, idempotency ledger,
                restock tasks, failures, and two reporting views
 test/          validate.mjs (node --test) and mocks/server.mjs
 docs/          screenshots from the real instance
 ```
+
+### Running it locally
+
+```bash
+cp infra/.env.example infra/.env     # the defaults are the mock's, and work as-is
+scripts/demo-up.sh
+```
+
+That starts n8n and Postgres, starts the mock WooCommerce/LLM/Slack server,
+imports the four workflows, creates the three credentials, points 01–03 at 04 as
+their error workflow, and activates everything. The editor is then on
+`http://localhost:5679`. `scripts/demo-down.sh` removes the containers and the
+volume, so the next run starts from an empty database.
+
+Send it a message:
+
+```bash
+curl -X POST http://localhost:5679/webhook/support/inbound \
+  -H 'content-type: application/json' \
+  -H "x-support-secret: $(grep '^SUPPORT_WEBHOOK_SECRET=' infra/.env | cut -d= -f2-)" \
+  -d '{"from":"priya.nair@example.com","message":"Where has order 1042 got to?"}'
+```
+
+The decision lands in `support_decisions`; anything the gate refuses lands in
+`human_review_queue` as well.
 
 ### Importing
 

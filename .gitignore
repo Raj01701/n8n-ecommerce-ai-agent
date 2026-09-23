@@ -5,6 +5,8 @@ infra/.env
 
 # Local runtime artefacts
 node_modules/
+.mock.log
+.mock.pid
 npm-debug.log*
 .DS_Store
 
